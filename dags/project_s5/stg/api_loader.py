@@ -130,61 +130,81 @@ class APILoader:
             return loaded_count
 
     # ЗАГРУЗКА ДОСТАВОК
-    def sync_deliveries(self, restaurant_id: str) -> int:
-        """
-        Загружает доставки для конкретного ресторана за 7 дней.
-        restaurant_id: ID ресторана для фильтрации доставок
-        """
+    def sync_deliveries(self, restaurant_id: str, execution_date: datetime = None) -> int:
+        """Загружает доставки для конкретного ресторана за период."""
+        # Если execution_date не передана, используем текущую дату (для обратной совместимости)
+        if execution_date is None:
+            execution_date = datetime.now()
+
         with self.pg_dest.connection() as conn:
-            # 1. Читаем прогресс
+            # Читаем прогресс из workflow-настроек
             wf_setting = self.settings.get_setting(conn, self.WF_KEY_DELIVERIES)
             if not wf_setting:
                 wf_setting = EtlSetting(
-                    id=0,
-                    workflow_key=self.WF_KEY_DELIVERIES,
-                    workflow_settings={
-                        self.LAST_UPDATED_KEY: None,
-                        "last_restaurant_id": None
-                    }
-                )
+                id=0,
+                workflow_key=self.WF_KEY_DELIVERIES,
+                workflow_settings={
+                    self.LAST_UPDATED_KEY: None,
+                    "last_restaurant_id": None
+                })
 
-            # 2. Вычисляем период (7 дней)
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=7)
+            # Вычисляем период на основе execution_date. Загружаем данные за один день
+            to_date = execution_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+            from_date = execution_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
             self.log.info(f"Starting deliveries sync for restaurant {restaurant_id}")
             self.log.info(f"Period: {from_date.strftime('%Y-%m-%d %H:%M:%S')} to {to_date.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # 3. Загружаем доставки из API
-            deliveries: List[Dict] = self.api_reader.fetch_all_deliveries(
-                restaurant_id=restaurant_id,
-                days_back=7
-            )
+            # Загружаем доставки из API с пагинацией
+            loaded_count = 0
+            offset = 0
+            limit = 50
 
-            self.log.info(f"Fetched {len(deliveries)} deliveries from API")
+            while True:
+                # Запрашиваем страницу данных с текущим офсетом
+                page_deliveries: List[Dict] = self.api_reader.client.get_deliveries(
+                    restaurant_id=restaurant_id,
+                    from_date=from_date.strftime(self.api_reader.client.DATE_FORMAT),
+                    to_date=to_date.strftime(self.api_reader.client.DATE_FORMAT),
+                    offset=offset
+                )
 
-            if not deliveries:
-                self.log.info(f"No deliveries for restaurant {restaurant_id}. Quitting.")
+                # Если страница пуста — завершаем загрузку
+                if not page_deliveries:
+                    self.log.info(f"No more deliveries at offset {offset}. Pagination complete.")
+                    break
+
+                # Сохраняем каждую запись из страницы в STG
+                for delivery in page_deliveries:
+                    self.pg_saver.save_delivery(
+                        conn=conn,
+                        delivery_id=delivery["delivery_id"],  # Бизнес-ключ
+                        update_ts=datetime.now(),
+                        val=delivery
+                    )
+                    loaded_count += 1
+
+                self.log.info(f"Loaded page: offset={offset}, count={len(page_deliveries)}, total={loaded_count}")
+
+                # Если записей меньше лимита — это последняя страница
+                if len(page_deliveries) < limit:
+                    self.log.info(f"Last page received ({len(page_deliveries)} < {limit}). Stopping pagination.")
+                    break
+                offset += limit  # Увеличиваем офсет для следующей итерации
+
+            self.log.info(f"Fetched {loaded_count} deliveries from API for restaurant {restaurant_id}")
+
+            if loaded_count == 0:
+                self.log.info(f"No deliveries for restaurant {restaurant_id} in period. Quitting.")
                 return 0
 
-            # 4. Сохраняем в STG
-            loaded_count = 0
-            for delivery in deliveries:
-                self.pg_saver.save_delivery(
-                    conn=conn,
-                    delivery_id=delivery["delivery_id"],  # Бизнес-ключ
-                    update_ts=datetime.now(),
-                    val=delivery
-                )
-                loaded_count += 1
-
-            # 5. Сохраняем прогресс
+            # Сохраняем прогресс в workflow-настройки
             wf_setting.workflow_settings[self.LAST_UPDATED_KEY] = to_date.isoformat()
             wf_setting.workflow_settings["last_restaurant_id"] = restaurant_id
             self.settings.save_setting(
                 conn,
                 wf_setting.workflow_key,
-                json2str(wf_setting.workflow_settings)
+                 json2str(wf_setting.workflow_settings)
             )
 
             self.log.info(f"Loaded {loaded_count} deliveries for restaurant {restaurant_id}")

@@ -9,7 +9,7 @@ log = logging.getLogger(__name__)
 
 
 @dag(
-    schedule_interval='0/15 * * * *',
+    schedule_interval='0 2 1 * *',
     start_date=pendulum.datetime(2022, 5, 5, tz="UTC"),
     catchup=False,
     tags=['sprint5', 'project', 'cdm'],
